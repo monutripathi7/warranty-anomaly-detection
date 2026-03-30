@@ -77,6 +77,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | POST | `/predict` | Score a single claim (JSON body) |
 | POST | `/predict/batch` | Score multiple claims in one request (JSON body) |
 | POST | `/predict/batch/csv` | Upload a CSV file and score every row |
+| POST | `/explain` | SHAP feature contributions for a single claim |
 | GET | `/health` | Health check with model status |
 
 ### Single Prediction
@@ -168,7 +169,7 @@ The CSV endpoint accepts common column name variations (spaces, lowercase) and r
 ├── tests/
 │   ├── test_data_engine.py         # 14 property tests
 │   ├── test_trainer.py             # 4 property tests
-│   └── test_api.py                 # 9 tests (5 property + 4 batch)
+│   └── test_api.py                 # 11 tests (5 property + 4 batch + 2 explain)
 ├── docs/
 │   ├── DETAILED_DOCUMENTATION.md   # Full technical documentation
 │   └── SUMMARY.md                  # Short overview
@@ -177,7 +178,7 @@ The CSV endpoint accepts common column name variations (spaces, lowercase) and r
 
 ## Testing
 
-27 tests (23 property-based using [Hypothesis](https://hypothesis.readthedocs.io/) + 4 batch endpoint tests) covering 20 correctness properties:
+29 tests (23 property-based using [Hypothesis](https://hypothesis.readthedocs.io/) + 4 batch + 2 explainability) covering 20 correctness properties:
 
 ```bash
 pip install pytest hypothesis httpx
@@ -194,6 +195,7 @@ pytest tests/ -v
 | Dashboard | Inline HTML/JS |
 | Data format | Apache Parquet |
 | Testing | pytest + Hypothesis |
+| Explainability | SHAP (TreeExplainer) |
 
 ## Documentation
 

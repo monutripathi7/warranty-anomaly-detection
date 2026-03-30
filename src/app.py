@@ -12,6 +12,7 @@ Endpoints:
     POST /predict           → score one claim
     POST /predict/batch     → score a list of claims (JSON body)
     POST /predict/batch/csv → score claims from an uploaded CSV file
+    POST /explain           → SHAP feature contributions for one claim
 
 Author: Monish Modi
 """
@@ -179,45 +180,39 @@ def _normalize_csv_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=rename)
 
 # ---------------------------------------------------------------------------
-# Shared scoring logic
+# Shared feature engineering
 #
-# Both the single /predict and the batch endpoints need to run the same
-# feature engineering + model inference pipeline. This helper takes a plain
-# dict (from Pydantic .model_dump() or a CSV row) and returns the result.
-# Errors are returned inline as {"error": "..."} instead of raising, so
-# one bad row in a batch doesn't kill the whole request.
+# Both scoring and SHAP explanation need the same feature DataFrame built
+# from a raw claim dict. This helper does the date parsing, categorical
+# encoding, tax calculation, and derived features — returning either a
+# ready-to-score DataFrame or an error dict.
 # ---------------------------------------------------------------------------
 
-def _score_single_claim(claim_dict: dict) -> dict:
-    """Run feature engineering and model inference on one claim.
+def _build_feature_df(claim_dict: dict):
+    """Turn a raw claim dict into a single-row DataFrame matching FEATURE_COLS.
 
-    Returns {"anomaly_probability": float, "flag_for_audit": bool}
-    on success, or {"error": str} if something is wrong with the row.
+    Returns (df, None) on success or (None, {"error": str}) on failure.
     """
-    # parse the three date fields
     try:
         claim_date = dt.strptime(claim_dict["Claim_Date"], "%Y-%m-%d")
         ro_date    = dt.strptime(claim_dict["RO_Date"],    "%Y-%m-%d")
         pdctn_date = dt.strptime(claim_dict["Pdctn_Date"], "%Y-%m-%d")
     except (ValueError, KeyError) as e:
-        return {"error": f"bad date: {e}"}
+        return None, {"error": f"bad date: {e}"}
 
     try:
-        # encode categoricals using the saved mappings from training
         cat_indices = {}
         for col in CATEGORICAL_COLS:
             value = claim_dict.get(col)
             mapping = categorical_mappings.get(col, {})
             if value not in mapping:
-                return {"error": f"Unknown value '{value}' for {col}"}
+                return None, {"error": f"Unknown value '{value}' for {col}"}
             cat_indices[col + "_idx"] = mapping[value]
 
-        # replicate the same tax / total calculation the trainer uses
         pre_tax   = float(claim_dict["Part_Cost"]) + float(claim_dict["Labour"]) + float(claim_dict["Sublet"])
-        igst      = pre_tax * 0.18          # assume inter-state (majority case)
+        igst      = pre_tax * 0.18
         total_amt = pre_tax + igst
 
-        # derived temporal + ratio features
         vehicle_age_days  = (claim_date - pdctn_date).days
         claim_ro_gap_days = (claim_date - ro_date).days
         tax_rate          = igst / max(pre_tax, 1e-6)
@@ -237,7 +232,22 @@ def _score_single_claim(claim_dict: dict) -> dict:
         row.update(cat_indices)
 
         df = pd.DataFrame([row], columns=FEATURE_COLS)
+        return df, None
+    except Exception as e:
+        return None, {"error": str(e)}
 
+
+def _score_single_claim(claim_dict: dict) -> dict:
+    """Run feature engineering and model inference on one claim.
+
+    Returns {"anomaly_probability": float, "flag_for_audit": bool}
+    on success, or {"error": str} if something is wrong with the row.
+    """
+    df, err = _build_feature_df(claim_dict)
+    if err:
+        return err
+
+    try:
         if model_type == "xgboost":
             import xgboost as xgb
             dmat = xgb.DMatrix(df)
@@ -297,6 +307,20 @@ def _build_dashboard_html() -> str:
   .flag-audit { background: #fee2e2; color: #991b1b; }
   .error-msg { color: #dc2626; text-align: center; padding: 12px; font-weight: 500; }
   .sample-section { display: flex; gap: 10px; flex-wrap: wrap; }
+  /* SHAP contribution chart */
+  .shap-chart { margin-top: 20px; }
+  .shap-bar-row { display: flex; align-items: center; margin-bottom: 4px; font-size: 0.82rem; }
+  .shap-bar-label { width: 160px; text-align: right; padding-right: 10px; color: #555; flex-shrink: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .shap-bar-track { flex: 1; height: 20px; position: relative; background: #f0f0f0; border-radius: 3px; }
+  .shap-bar-fill { position: absolute; top: 0; height: 100%; border-radius: 3px; min-width: 2px; }
+  .shap-bar-fill.positive { background: #ef4444; }
+  .shap-bar-fill.negative { background: #3b82f6; }
+  .shap-bar-val { width: 70px; text-align: left; padding-left: 8px; font-weight: 600; font-size: 0.78rem; }
+  .shap-legend { display: flex; gap: 16px; margin-bottom: 10px; font-size: 0.8rem; color: #555; }
+  .shap-legend span { display: inline-flex; align-items: center; gap: 4px; }
+  .shap-legend .dot { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  .shap-legend .dot-pos { background: #ef4444; }
+  .shap-legend .dot-neg { background: #3b82f6; }
   /* batch / CSV upload styles */
   .csv-upload-area { border: 2px dashed #ccd1d9; border-radius: 8px; padding: 28px; text-align: center; cursor: pointer; transition: border-color 0.2s, background 0.2s; }
   .csv-upload-area:hover, .csv-upload-area.dragover { border-color: #3b82f6; background: #eff6ff; }
@@ -475,6 +499,16 @@ def _build_dashboard_html() -> str:
       <div class="flag" id="result-flag"></div>
     </div>
     <div class="error-msg" id="result-error" style="display:none;"></div>
+    <!-- SHAP feature contribution chart -->
+    <div class="shap-chart" id="shap-chart" style="display:none;">
+      <h2 style="margin-top:18px;">Feature Contributions (SHAP)</h2>
+      <p style="font-size:0.82rem;color:#666;margin-bottom:10px;">Shows which features pushed the anomaly score up (red) or down (blue). Sorted by impact.</p>
+      <div class="shap-legend">
+        <span><span class="dot dot-pos"></span> Increases anomaly score</span>
+        <span><span class="dot dot-neg"></span> Decreases anomaly score</span>
+      </div>
+      <div id="shap-bars"></div>
+    </div>
   </div>
 
 </div>
@@ -542,9 +576,12 @@ async function submitClaim(e) {
   resultBox.style.display  = "none";
   resultError.style.display = "none";
   resultProb.textContent = "...";
+  document.getElementById("shap-chart").style.display = "none";
 
   try {
-    const resp = await fetch("/predict", {
+    // call /explain instead of /predict — it returns the same score
+    // plus SHAP feature contributions for the bar chart
+    const resp = await fetch("/explain", {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify(data)
@@ -568,10 +605,45 @@ async function submitClaim(e) {
       resultFlag.className = "flag flag-safe";
       resultFlag.innerHTML = "&#10003; No Audit Required";
     }
+
+    // render the SHAP contribution bar chart
+    if (result.contributions && result.contributions.length > 0) {
+      renderShapChart(result.contributions);
+    }
   } catch (err) {
     resultError.style.display = "block";
     resultError.textContent = "Error: " + err.message;
   }
+}
+
+/* ---- SHAP contribution bar chart ---- */
+function renderShapChart(contributions) {
+  const container = document.getElementById('shap-chart');
+  const barsDiv   = document.getElementById('shap-bars');
+  container.style.display = 'block';
+
+  // find the max absolute SHAP value for scaling the bars
+  const maxAbs = Math.max(...contributions.map(c => Math.abs(c.shap_value)), 0.001);
+
+  // show top 12 features to keep the chart readable
+  const top = contributions.slice(0, 12);
+
+  let html = '';
+  for (const c of top) {
+    const pct   = Math.abs(c.shap_value) / maxAbs * 100;
+    const cls   = c.shap_value >= 0 ? 'positive' : 'negative';
+    const sign  = c.shap_value >= 0 ? '+' : '';
+    // positive bars grow right from center, negative bars grow left
+    const style = c.shap_value >= 0
+      ? 'left:50%; width:' + (pct/2) + '%;'
+      : 'right:50%; width:' + (pct/2) + '%;';
+    html += '<div class="shap-bar-row">' +
+      '<div class="shap-bar-label" title="' + c.feature + '">' + c.label + '</div>' +
+      '<div class="shap-bar-track"><div class="shap-bar-fill ' + cls + '" style="' + style + '"></div></div>' +
+      '<div class="shap-bar-val" style="color:' + (c.shap_value >= 0 ? '#dc2626' : '#2563eb') + '">' +
+        sign + c.shap_value.toFixed(4) + '</div></div>';
+  }
+  barsDiv.innerHTML = html;
 }
 
 /* ---- CSV batch upload handlers ---- */
@@ -828,6 +900,127 @@ async def predict_batch_csv(file: UploadFile = File(...)):
         results.append(result)
 
     return {"total": len(results), "results": results}
+
+
+# ---------------------------------------------------------------------------
+# SHAP explainability
+#
+# TreeExplainer gives exact Shapley values for tree-based models (XGBoost,
+# LightGBM) in polynomial time. We initialise it lazily on the first
+# /explain call so startup isn't slowed down if nobody uses it.
+#
+# The response includes per-feature SHAP values, the base value (average
+# model output), and human-readable feature names so the dashboard can
+# render a contribution bar chart without any extra mapping.
+# ---------------------------------------------------------------------------
+
+_shap_explainer = None
+
+
+def _get_shap_explainer():
+    """Lazy-init the SHAP TreeExplainer. Cached after first call."""
+    global _shap_explainer
+    if _shap_explainer is not None:
+        return _shap_explainer
+
+    import shap
+    _shap_explainer = shap.TreeExplainer(model)
+    logger.info("SHAP TreeExplainer initialised.")
+    return _shap_explainer
+
+
+# human-friendly labels for the 19 model features — used in the /explain
+# response so the dashboard can show readable names instead of column codes
+_FEATURE_LABELS = {
+    "Mileage": "Mileage (km)",
+    "Part_Cost": "Part Cost",
+    "Labour": "Labour Cost",
+    "Sublet": "Sublet Cost",
+    "Total_Amt": "Total Amount",
+    "IGST": "IGST",
+    "CGST": "CGST",
+    "SGST": "SGST",
+    "Approve_Amount_by_HMI": "HMI Approved Amount",
+    "Vehicle_Age_Days": "Vehicle Age (days)",
+    "Claim_RO_Gap_Days": "Claim-RO Gap (days)",
+    "Tax_Rate": "Tax Rate",
+    "Approval_Ratio": "Approval Ratio",
+    "Claim_Type_idx": "Claim Type",
+    "Part_Type_idx": "Part Type",
+    "Cause_idx": "Cause Code",
+    "Nature_idx": "Nature Code",
+    "Status_idx": "Claim Status",
+    "Dealership_idx": "Dealership",
+}
+
+
+@app.post("/explain")
+def explain(claim: ClaimRequest):
+    """Return SHAP feature contributions for a single claim.
+
+    This tells you *why* the model scored a claim the way it did — which
+    features pushed the probability up and which pulled it down. Useful
+    for auditors who need to understand a flagged claim, and demonstrates
+    interpretable ML in an academic context.
+    """
+    if not model_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    df, err = _build_feature_df(claim.model_dump())
+    if err:
+        raise HTTPException(status_code=422, detail=err["error"])
+
+    try:
+        explainer = _get_shap_explainer()
+
+        if model_type == "xgboost":
+            import xgboost as xgb
+            dmat = xgb.DMatrix(df)
+            shap_values = explainer.shap_values(dmat)
+            base_value = float(explainer.expected_value)
+            score = float(model.predict(dmat)[0])
+        else:
+            shap_values = explainer.shap_values(df)
+            # LightGBM binary classifier returns [class_0, class_1] arrays
+            if isinstance(shap_values, list) and len(shap_values) == 2:
+                shap_values = shap_values[1]
+            base_value = float(
+                explainer.expected_value[1]
+                if isinstance(explainer.expected_value, (list, np.ndarray))
+                else explainer.expected_value
+            )
+            score = float(model.predict(df)[0])
+
+        # shap_values is shape (1, 19) — flatten to a plain list
+        sv = shap_values[0] if hasattr(shap_values, '__len__') and len(shap_values) > 0 else shap_values
+        if hasattr(sv, 'values'):
+            sv = sv.values  # shap Explanation object
+        if hasattr(sv, '__len__') and len(sv) > 0 and hasattr(sv[0], '__len__'):
+            sv = sv[0]
+        contributions = []
+        for i, col in enumerate(FEATURE_COLS):
+            contributions.append({
+                "feature": col,
+                "label": _FEATURE_LABELS.get(col, col),
+                "shap_value": round(float(sv[i]), 6),
+                "feature_value": float(df.iloc[0][col]),
+            })
+
+        # sort by absolute impact so the biggest drivers come first
+        contributions.sort(key=lambda c: abs(c["shap_value"]), reverse=True)
+
+        return {
+            "anomaly_probability": round(score, 4),
+            "flag_for_audit": bool(score > 0.8),
+            "base_value": round(base_value, 6),
+            "contributions": contributions,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Explain error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="SHAP explanation failed")
 
 
 # To run locally: uvicorn app:app --reload

@@ -41,7 +41,7 @@ project/
 ├── tests/
 │   ├── test_data_engine.py         # 14 property tests (Properties 1-14)
 │   ├── test_trainer.py             # 4 property tests (Properties 15-18)
-│   └── test_api.py                 # 9 tests: 5 property (Properties 19-20) + 4 batch
+│   └── test_api.py                 # 11 tests: 5 property (Properties 19-20) + 4 batch + 2 explain
 ├── docs/
 │   ├── DETAILED_DOCUMENTATION.md   # This file
 │   └── SUMMARY.md                  # Short overview
@@ -209,6 +209,7 @@ Categorical mappings are saved to `categorical_mappings.json` during training an
 | POST | `/predict` | Score a single warranty claim | `{"anomaly_probability": 0.0342, "flag_for_audit": false}` |
 | POST | `/predict/batch` | Score multiple claims (JSON body) | `{"total": N, "results": [...]}` |
 | POST | `/predict/batch/csv` | Score claims from an uploaded CSV file | `{"total": N, "results": [...]}` |
+| POST | `/explain` | SHAP feature contributions for one claim | `{"anomaly_probability": ..., "base_value": ..., "contributions": [...]}` |
 
 ### Model Loading
 - Auto-detects model format at startup
@@ -309,14 +310,62 @@ Both batch endpoints and the single `/predict` endpoint share the same feature e
 - All origins allowed (`allow_origins=["*"]`) for development
 - Should be restricted to specific domains in production
 
-## 9. Web Dashboard
+## 9. Model Explainability (SHAP)
+
+### Overview
+The `/explain` endpoint uses SHAP (SHapley Additive exPlanations) to decompose a prediction into per-feature contributions. For tree-based models like XGBoost and LightGBM, SHAP's `TreeExplainer` computes exact Shapley values in polynomial time — no sampling or approximation needed.
+
+This is important for two reasons:
+1. Auditors need to understand *why* a claim was flagged, not just that it was flagged
+2. Interpretable ML is a core requirement in regulated industries and academic evaluation
+
+### How It Works
+1. The claim goes through the same feature engineering pipeline as `/predict`
+2. SHAP's `TreeExplainer` decomposes the model output into additive contributions from each of the 19 features
+3. The response includes a `base_value` (average model output across training data) and a `contributions` array sorted by absolute impact
+
+### Request / Response
+
+```json
+POST /explain
+{
+  "Mileage": 45000,
+  "Part_Cost": 42000,
+  "...": "..."
+}
+```
+
+```json
+{
+  "anomaly_probability": 0.91,
+  "flag_for_audit": true,
+  "base_value": 0.005,
+  "contributions": [
+    {"feature": "Part_Cost", "label": "Part Cost", "shap_value": 0.4523, "feature_value": 42000.0},
+    {"feature": "Approval_Ratio", "label": "Approval Ratio", "shap_value": 0.2101, "feature_value": 0.85},
+    {"feature": "Vehicle_Age_Days", "label": "Vehicle Age (days)", "shap_value": -0.0312, "feature_value": 1020.0},
+    "..."
+  ]
+}
+```
+
+Positive SHAP values push the anomaly score up; negative values pull it down. The `contributions` array is sorted by absolute impact so the biggest drivers appear first.
+
+### Dashboard Integration
+When a claim is submitted through the dashboard, it calls `/explain` instead of `/predict`. The result card shows the anomaly probability alongside a horizontal bar chart of the top 12 feature contributions — red bars for features increasing the score, blue bars for features decreasing it.
+
+### Lazy Initialization
+The SHAP `TreeExplainer` is initialized on the first `/explain` call and cached for subsequent requests. This avoids slowing down server startup when explainability isn't needed.
+
+## 10. Web Dashboard
 
 ### Features
 - Modi Auto Group branding (dark blue header)
 - Responsive grid layout (2-3 columns)
 - Form with all 14 input fields: number inputs, date pickers, dropdowns
-- JavaScript fetch() to POST /predict on form submit
+- JavaScript fetch() to POST /explain on form submit (returns score + SHAP breakdown)
 - Result display with anomaly probability percentage
+- SHAP feature contribution bar chart (top 12 features, red = increases score, blue = decreases)
 - Red warning indicator when flag_for_audit is true (probability > 80%)
 - Green "No Audit Required" indicator when safe
 - CSV batch upload with drag-and-drop support
@@ -329,7 +378,7 @@ Both batch endpoints and the single `/predict` endpoint share the same feature e
 | Cost Anomaly | Red | Part_Cost=42000, RS10000PARTS, Viva Honda | High anomaly score (Part_Cost > 35000) |
 | Temporal Anomaly | Red | Mileage=120000, Regular, Pdctn_Date=2017-01-15 | High anomaly score (vehicle > 5 years old) |
 
-## 10. Google Colab Pipeline
+## 11. Google Colab Pipeline
 
 ### Setup (T4 GPU runtime)
 ```python
@@ -351,7 +400,7 @@ Both batch endpoints and the single `/predict` endpoint share the same feature e
 1. `warranty_model_v1.json` — trained XGBoost model
 2. `categorical_mappings.json` — categorical encoding mappings
 
-## 11. Testing
+## 12. Testing
 
 ### Framework
 - pytest for unit/integration tests
@@ -383,14 +432,15 @@ Both batch endpoints and the single `/predict` endpoint share the same feature e
 | 19 | Prediction Response Format & Threshold | test_api.py | Req 7.1-7.3 |
 | 20 | Input Validation Rejects Invalid Inputs | test_api.py | Req 7.4, 8.3, 8.4 |
 | 21-24 | Batch Prediction (JSON + CSV + edge cases) | test_api.py | Req 7.1-7.3 |
+| 25-26 | SHAP Explainability (response format + validation) | test_api.py | Req 7.1-7.3 |
 
 ### Running Tests
 ```bash
 pip install pytest hypothesis httpx
-pytest tests/ -v   # 27 tests total
+pytest tests/ -v   # 29 tests total
 ```
 
-## 12. Deployment
+## 13. Deployment
 
 ### VPS Deployment (CPU-only)
 The trained model and categorical mappings are included in `src/`, so deployment only requires the `src/` directory:
@@ -412,6 +462,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 - uvicorn
 - xgboost (if using XGBoost model) OR lightgbm (if using LightGBM model)
 - pandas
+- shap
 - joblib (if using LightGBM model)
 
 #### Training (Local)
@@ -433,7 +484,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 - hypothesis
 - httpx (for API tests)
 
-## 13. Error Handling
+## 14. Error Handling
 
 | Scenario | Handling | HTTP Code |
 |----------|----------|-----------|
@@ -444,6 +495,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | Invalid date format | Caught in endpoint handler | 422 |
 | Unknown categorical in mappings | Explicit check against mappings dict | 422 |
 | Model prediction error | Catch exception, log traceback | 500 |
+| SHAP explanation failure | Catch exception, log traceback | 500 |
 | Batch too large (>500 claims) | Size check before processing | 422 |
 | Non-CSV file uploaded | Extension check | 422 |
 | Unparseable CSV file | Catch pandas read_csv error | 422 |
@@ -452,7 +504,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | No class variation in labels | ValueError raised | N/A |
 | Division by zero in features | max(denominator, 1e-6) | N/A |
 
-## 14. Technology Stack
+## 15. Technology Stack
 
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
@@ -464,3 +516,4 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | Dashboard | Inline HTML/JS | Zero build step, served by FastAPI |
 | Data format | Apache Parquet | Columnar compression, efficient for 10M+ rows |
 | Testing | pytest + hypothesis | Property-based testing for correctness guarantees |
+| Explainability | SHAP (TreeExplainer) | Exact Shapley values for tree models, no approximation |

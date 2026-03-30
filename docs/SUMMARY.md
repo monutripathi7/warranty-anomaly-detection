@@ -52,10 +52,11 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
 ## API Endpoints
-- `GET /` — Web dashboard with form, sample records, and CSV batch upload
+- `GET /` — Web dashboard with form, sample records, CSV upload, and SHAP charts
 - `POST /predict` — Score a single claim (JSON in, anomaly score out)
 - `POST /predict/batch` — Score multiple claims in one JSON request
 - `POST /predict/batch/csv` — Upload a CSV file and score every row
+- `POST /explain` — SHAP feature contributions for a single claim
 - `GET /health` — Status check
 
 ## Model Details
@@ -66,10 +67,10 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 - Metric: PR-AUC (correct for imbalanced anomaly detection)
 
 ## Testing
-27 tests (23 property-based using hypothesis + 4 batch endpoint tests) covering 20+ correctness properties:
+29 tests (23 property-based using hypothesis + 4 batch + 2 explainability) covering 20+ correctness properties:
 ```bash
 pytest tests/ -v
 ```
 
 ## Tech Stack
-Polars, NumPy, XGBoost/LightGBM, FastAPI, Pydantic, CuPy (GPU), Apache Parquet, pytest + hypothesis
+Polars, NumPy, XGBoost/LightGBM, FastAPI, Pydantic, SHAP, CuPy (GPU), Apache Parquet, pytest + hypothesis

@@ -308,3 +308,66 @@ def test_batch_csv_rejects_non_csv():
         assert resp.status_code == 422
     finally:
         _restore_app(app_module, *restore_args)
+
+
+# ---------------------------------------------------------------------------
+# SHAP explainability tests
+#
+# We can't use a real TreeExplainer with a MagicMock model, so we patch
+# the _get_shap_explainer function to return a fake explainer that gives
+# us controllable SHAP values.
+# ---------------------------------------------------------------------------
+
+def test_explain_returns_contributions():
+    """POST /explain should return anomaly_probability, base_value, and
+    a contributions list with one entry per feature."""
+    from unittest.mock import patch
+
+    client, app_module, *restore_args = _make_test_client(0.65)
+    try:
+        # build a fake SHAP explainer that returns predictable values
+        fake_shap_values = np.zeros((1, 19))
+        fake_shap_values[0, 0] = 0.15   # Mileage pushes score up
+        fake_shap_values[0, 1] = -0.08  # Part_Cost pulls it down
+
+        fake_explainer = MagicMock()
+        fake_explainer.shap_values.return_value = fake_shap_values
+        fake_explainer.expected_value = 0.5
+
+        with patch.object(app_module, "_get_shap_explainer", return_value=fake_explainer):
+            resp = client.post("/explain", json=_get_base_valid_claim())
+
+        assert resp.status_code == 200
+        data = resp.json()
+
+        # must have the prediction score
+        assert "anomaly_probability" in data
+        assert 0.0 <= data["anomaly_probability"] <= 1.0
+
+        # must have the SHAP base value
+        assert "base_value" in data
+
+        # must have exactly 19 feature contributions (one per FEATURE_COL)
+        assert "contributions" in data
+        assert len(data["contributions"]) == 19
+
+        # each contribution should have the right keys
+        for c in data["contributions"]:
+            assert "feature" in c
+            assert "label" in c
+            assert "shap_value" in c
+            assert "feature_value" in c
+
+        # contributions should be sorted by absolute SHAP value (biggest first)
+        abs_vals = [abs(c["shap_value"]) for c in data["contributions"]]
+        assert abs_vals == sorted(abs_vals, reverse=True)
+    finally:
+        _restore_app(app_module, *restore_args)
+
+
+def test_explain_rejects_invalid_input():
+    """POST /explain with missing fields should return 422, same as /predict."""
+    payload = _get_base_valid_claim()
+    del payload["Mileage"]
+    resp = _validation_client.post("/explain", json=payload)
+    assert resp.status_code == 422
