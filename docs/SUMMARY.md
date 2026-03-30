@@ -19,12 +19,12 @@ AI system that flags suspicious warranty claims across Modi Auto Group's dealers
 ## Key Files
 | File | Purpose |
 |------|---------|
-| `app.py` | FastAPI server + dashboard (production) |
-| `data_engine.py` | Synthetic data generation (CPU) |
-| `trainer.py` | LightGBM training (CPU) |
-| `colab/xgb_full_pipeline.py` | GPU data gen + XGBoost training (Colab) |
-| `warranty_model_v1.json` | Trained model (XGBoost) |
-| `categorical_mappings.json` | Encoding mappings for inference |
+| `src/app.py` | FastAPI server + dashboard (production) |
+| `src/data_engine.py` | Synthetic data generation (CPU) |
+| `src/trainer.py` | LightGBM training (CPU) |
+| `src/warranty_model_v1.json` | Trained XGBoost model artifact |
+| `src/categorical_mappings.json` | Encoding mappings for inference |
+| `notebooks/xgb_full_pipeline.py` | GPU data gen + XGBoost training (Colab) |
 
 ## Quick Start
 
@@ -52,8 +52,10 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
 ## API Endpoints
-- `GET /` — Web dashboard with form and 3 sample test records
-- `POST /predict` — JSON in, anomaly score out
+- `GET /` — Web dashboard with form, sample records, and CSV batch upload
+- `POST /predict` — Score a single claim (JSON in, anomaly score out)
+- `POST /predict/batch` — Score multiple claims in one JSON request
+- `POST /predict/batch/csv` — Upload a CSV file and score every row
 - `GET /health` — Status check
 
 ## Model Details
@@ -64,7 +66,7 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 - Metric: PR-AUC (correct for imbalanced anomaly detection)
 
 ## Testing
-23 property-based tests using hypothesis covering all 20 correctness properties:
+27 tests (23 property-based using hypothesis + 4 batch endpoint tests) covering 20+ correctness properties:
 ```bash
 pytest tests/ -v
 ```

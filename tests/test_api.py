@@ -1,32 +1,44 @@
-"""Property-based tests for app.py prediction response and input validation (Properties 19–20).
+"""
+Tests for the FastAPI prediction endpoints.
 
-**Validates: Requirements 7.1, 7.2, 7.3, 7.4, 8.3, 8.4**
+Covers three areas:
+  1. Response format — every valid claim should come back with a probability
+     in [0, 1] and a flag_for_audit that matches the 0.8 threshold.
+  2. Input validation — missing fields, negative numbers, and bogus categorical
+     values should all get rejected with 422.
+  3. Batch prediction — the /predict/batch and /predict/batch/csv endpoints
+     should handle multiple claims in one go and return per-row results.
+
+Uses Hypothesis for property-based testing on the single-claim endpoints
+and plain pytest for the batch endpoints.
 """
 
 import sys
 import os
+import datetime
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 import numpy as np
-from hypothesis import given, settings, assume
+from hypothesis import given, settings
 from hypothesis import strategies as st
 from starlette.testclient import TestClient
 
 # ---------------------------------------------------------------------------
-# Allowed categorical value sets (from design doc / app.py Pydantic model)
+# Valid value sets — kept in sync with the Literal types in app.py
 # ---------------------------------------------------------------------------
+
 ALLOWED_CLAIM_TYPES = ["Campaign", "TMA", "Regular", "Free Service Labor Claim"]
-ALLOWED_PART_TYPES = ["NONCS1000PARTS", "RS10000PARTS"]
-ALLOWED_CAUSES = ["ZZ2", "ZZ3", "ZZ4", "ZZ7"]
+ALLOWED_PART_TYPES  = ["NONCS1000PARTS", "RS10000PARTS"]
+ALLOWED_CAUSES      = ["ZZ2", "ZZ3", "ZZ4", "ZZ7"]
 ALLOWED_NATURES = [
     "L23", "L24", "L31", "W11", "W13", "W17",
     "B32", "B33", "D91", "D92", "A38", "Q26",
     "V84", "V88", "DA1", "DJ6",
 ]
-ALLOWED_STATUSES = ["Open", "Pending", "Accept", "Suspense(P)"]
-ALLOWED_DEALERSHIPS = ["Modi Hyundai", "Viva Honda", "Modi Motors Mumbai", "Modi Motors Pune"]
+ALLOWED_STATUSES     = ["Open", "Pending", "Accept", "Suspense(P)"]
+ALLOWED_DEALERSHIPS  = ["Modi Hyundai", "Viva Honda", "Modi Motors Mumbai", "Modi Motors Pune"]
 
 REQUIRED_FIELDS = [
     "Mileage", "Part_Cost", "Labour", "Sublet",
@@ -37,157 +49,86 @@ REQUIRED_FIELDS = [
 
 
 # ---------------------------------------------------------------------------
-# Hypothesis strategies
+# Hypothesis strategy — generates a random but valid claim payload
 # ---------------------------------------------------------------------------
 
 @st.composite
 def valid_claim_request(draw):
-    """Generate a valid ClaimRequest payload dict."""
-    mileage = draw(st.integers(min_value=0, max_value=200000))
-    part_cost = draw(st.floats(min_value=0.0, max_value=50000.0, allow_nan=False, allow_infinity=False))
-    labour = draw(st.floats(min_value=0.0, max_value=5000.0, allow_nan=False, allow_infinity=False))
-    sublet = draw(st.floats(min_value=0.0, max_value=2000.0, allow_nan=False, allow_infinity=False))
+    """Build a claim dict that should always pass Pydantic validation."""
+    mileage     = draw(st.integers(min_value=0, max_value=200000))
+    part_cost   = draw(st.floats(min_value=0.0, max_value=50000.0, allow_nan=False, allow_infinity=False))
+    labour      = draw(st.floats(min_value=0.0, max_value=5000.0,  allow_nan=False, allow_infinity=False))
+    sublet      = draw(st.floats(min_value=0.0, max_value=2000.0,  allow_nan=False, allow_infinity=False))
     approve_amt = draw(st.floats(min_value=0.0, max_value=100000.0, allow_nan=False, allow_infinity=False))
 
-    claim_type = draw(st.sampled_from(ALLOWED_CLAIM_TYPES))
-    part_type = draw(st.sampled_from(ALLOWED_PART_TYPES))
-    cause = draw(st.sampled_from(ALLOWED_CAUSES))
-    nature = draw(st.sampled_from(ALLOWED_NATURES))
-    status = draw(st.sampled_from(ALLOWED_STATUSES))
-    dealership = draw(st.sampled_from(ALLOWED_DEALERSHIPS))
-
-    # Generate valid ISO date strings
-    claim_date = draw(st.dates(
-        min_value=__import__("datetime").date(2022, 1, 1),
-        max_value=__import__("datetime").date(2024, 12, 31),
-    ))
-    ro_offset = draw(st.integers(min_value=0, max_value=7))
+    claim_date   = draw(st.dates(min_value=datetime.date(2022, 1, 1), max_value=datetime.date(2024, 12, 31)))
+    ro_offset    = draw(st.integers(min_value=0, max_value=7))
     pdctn_offset = draw(st.integers(min_value=30, max_value=1800))
-
-    ro_date = claim_date - __import__("datetime").timedelta(days=ro_offset)
-    pdctn_date = claim_date - __import__("datetime").timedelta(days=pdctn_offset)
 
     return {
         "Mileage": mileage,
         "Part_Cost": round(part_cost, 2),
         "Labour": round(labour, 2),
         "Sublet": round(sublet, 2),
-        "Claim_Type": claim_type,
-        "Part_Type": part_type,
-        "Cause": cause,
-        "Nature": nature,
-        "Status": status,
-        "Dealership": dealership,
-        "Claim_Date": claim_date.isoformat(),
-        "RO_Date": ro_date.isoformat(),
-        "Pdctn_Date": pdctn_date.isoformat(),
+        "Claim_Type":  draw(st.sampled_from(ALLOWED_CLAIM_TYPES)),
+        "Part_Type":   draw(st.sampled_from(ALLOWED_PART_TYPES)),
+        "Cause":       draw(st.sampled_from(ALLOWED_CAUSES)),
+        "Nature":      draw(st.sampled_from(ALLOWED_NATURES)),
+        "Status":      draw(st.sampled_from(ALLOWED_STATUSES)),
+        "Dealership":  draw(st.sampled_from(ALLOWED_DEALERSHIPS)),
+        "Claim_Date":  claim_date.isoformat(),
+        "RO_Date":     (claim_date - datetime.timedelta(days=ro_offset)).isoformat(),
+        "Pdctn_Date":  (claim_date - datetime.timedelta(days=pdctn_offset)).isoformat(),
         "Approve_Amount_by_HMI": round(approve_amt, 2),
     }
 
 
 # ---------------------------------------------------------------------------
-# Mock model setup — used to create a TestClient with a controllable model
+# Test helpers — mock the model so we can control the returned probability
 # ---------------------------------------------------------------------------
 
 def _make_test_client(mock_probability: float):
-    """Create a TestClient with a mocked model returning the given probability.
+    """Spin up a TestClient with a fake model that always returns `mock_probability`.
 
-    We patch joblib.load and the categorical_mappings so the app starts
-    with model_loaded=True and deterministic categorical encoding.
+    We patch the module-level globals in app.py directly so the endpoint
+    handler thinks a real model is loaded. Categorical mappings use the
+    same sorted-value scheme the trainer produces.
     """
-    # Build categorical mappings matching the sorted-value scheme from trainer.py
     cat_mappings = {
-        "Claim_Type": {v: i for i, v in enumerate(sorted(ALLOWED_CLAIM_TYPES))},
-        "Part_Type": {v: i for i, v in enumerate(sorted(ALLOWED_PART_TYPES))},
-        "Cause": {v: i for i, v in enumerate(sorted(ALLOWED_CAUSES))},
-        "Nature": {v: i for i, v in enumerate(sorted(ALLOWED_NATURES))},
-        "Status": {v: i for i, v in enumerate(sorted(ALLOWED_STATUSES))},
-        "Dealership": {v: i for i, v in enumerate(sorted(ALLOWED_DEALERSHIPS))},
+        "Claim_Type":  {v: i for i, v in enumerate(sorted(ALLOWED_CLAIM_TYPES))},
+        "Part_Type":   {v: i for i, v in enumerate(sorted(ALLOWED_PART_TYPES))},
+        "Cause":       {v: i for i, v in enumerate(sorted(ALLOWED_CAUSES))},
+        "Nature":      {v: i for i, v in enumerate(sorted(ALLOWED_NATURES))},
+        "Status":      {v: i for i, v in enumerate(sorted(ALLOWED_STATUSES))},
+        "Dealership":  {v: i for i, v in enumerate(sorted(ALLOWED_DEALERSHIPS))},
     }
 
     mock_model = MagicMock()
     mock_model.predict.return_value = np.array([mock_probability])
 
-    # We need to reload the app module with patched globals
-    import importlib
     import app as app_module
 
-    # Patch the module-level globals directly
-    original_model = app_module.model
-    original_loaded = app_module.model_loaded
+    original_model    = app_module.model
+    original_loaded   = app_module.model_loaded
     original_mappings = app_module.categorical_mappings
 
-    app_module.model = mock_model
-    app_module.model_loaded = True
+    app_module.model               = mock_model
+    app_module.model_loaded        = True
     app_module.categorical_mappings = cat_mappings
 
     client = TestClient(app_module.app)
-
     return client, app_module, original_model, original_loaded, original_mappings
 
 
 def _restore_app(app_module, original_model, original_loaded, original_mappings):
-    """Restore original app module globals after test."""
-    app_module.model = original_model
-    app_module.model_loaded = original_loaded
+    """Put the app module back the way we found it."""
+    app_module.model               = original_model
+    app_module.model_loaded        = original_loaded
     app_module.categorical_mappings = original_mappings
 
 
-# ---------------------------------------------------------------------------
-# Property 19: Prediction Response Format and Threshold
-# Feature: warranty-anomaly-detection, Property 19: Prediction Response Format and Threshold
-# ---------------------------------------------------------------------------
-# **Validates: Requirements 7.1, 7.2, 7.3**
-
-
-@given(
-    claim=valid_claim_request(),
-    mock_prob=st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
-)
-@settings(max_examples=100)
-def test_prediction_response_format_and_threshold(claim, mock_prob):
-    """For any valid ClaimRequest, the response must contain anomaly_probability
-    in [0.0, 1.0] and flag_for_audit must equal (anomaly_probability > 0.8)."""
-    client, app_module, orig_model, orig_loaded, orig_mappings = _make_test_client(mock_prob)
-    try:
-        response = client.post("/predict", json=claim)
-
-        assert response.status_code == 200, (
-            f"Expected 200 for valid claim, got {response.status_code}: {response.text}"
-        )
-
-        data = response.json()
-
-        # Response must contain anomaly_probability
-        assert "anomaly_probability" in data, "Response missing 'anomaly_probability' key"
-
-        # anomaly_probability must be in [0.0, 1.0]
-        prob = data["anomaly_probability"]
-        assert isinstance(prob, (int, float)), f"anomaly_probability is not numeric: {type(prob)}"
-        assert 0.0 <= prob <= 1.0, f"anomaly_probability {prob} not in [0.0, 1.0]"
-
-        # Response must contain flag_for_audit
-        assert "flag_for_audit" in data, "Response missing 'flag_for_audit' key"
-
-        # flag_for_audit must equal (anomaly_probability > 0.8)
-        expected_flag = prob > 0.8
-        assert data["flag_for_audit"] == expected_flag, (
-            f"flag_for_audit={data['flag_for_audit']} but anomaly_probability={prob}, "
-            f"expected flag_for_audit={expected_flag}"
-        )
-    finally:
-        _restore_app(app_module, orig_model, orig_loaded, orig_mappings)
-
-
-# ---------------------------------------------------------------------------
-# Property 20: Input Validation Rejects Invalid Inputs
-# Feature: warranty-anomaly-detection, Property 20: Input Validation Rejects Invalid Inputs
-# ---------------------------------------------------------------------------
-# **Validates: Requirements 7.4, 8.3, 8.4**
-
-
 def _get_base_valid_claim():
-    """Return a known-valid claim payload for mutation."""
+    """A known-good claim payload we can mutate for negative tests."""
     return {
         "Mileage": 45000,
         "Part_Cost": 1200.0,
@@ -206,22 +147,80 @@ def _get_base_valid_claim():
     }
 
 
-# Strategy: pick a required field to remove
-_missing_field_strategy = st.sampled_from(REQUIRED_FIELDS)
+# ---------------------------------------------------------------------------
+# Property: response format and audit threshold
+#
+# For any valid claim, the API must return anomaly_probability in [0, 1]
+# and flag_for_audit == (probability > 0.8).
+# ---------------------------------------------------------------------------
 
-# Strategy: generate negative mileage
-_negative_mileage_strategy = st.integers(min_value=-100000, max_value=-1)
-
-# Strategy: generate negative cost values
-_negative_cost_strategy = st.floats(
-    min_value=-1e6, max_value=-0.01, allow_nan=False, allow_infinity=False
+@given(
+    claim=valid_claim_request(),
+    mock_prob=st.floats(min_value=0.0, max_value=1.0, allow_nan=False, allow_infinity=False),
 )
+@settings(max_examples=100)
+def test_prediction_response_format_and_threshold(claim, mock_prob):
+    client, app_module, *restore_args = _make_test_client(mock_prob)
+    try:
+        resp = client.post("/predict", json=claim)
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
 
-# Strategy: pick a cost field to make negative
-_cost_field_strategy = st.sampled_from(["Part_Cost", "Labour", "Sublet", "Approve_Amount_by_HMI"])
+        data = resp.json()
+        prob = data["anomaly_probability"]
+        assert 0.0 <= prob <= 1.0, f"probability {prob} out of range"
+        assert data["flag_for_audit"] == (prob > 0.8), (
+            f"flag mismatch: prob={prob}, flag={data['flag_for_audit']}"
+        )
+    finally:
+        _restore_app(app_module, *restore_args)
 
-# Strategy: generate invalid categorical values
-_invalid_categorical_strategy = st.tuples(
+
+# ---------------------------------------------------------------------------
+# Property: input validation rejects bad inputs
+#
+# Missing fields, negative numerics, and invalid categoricals should all
+# get a 422 before any model code runs.
+# ---------------------------------------------------------------------------
+
+# Pydantic validation fires before the handler, so we don't need a loaded model
+import app as _app_module
+_validation_client = TestClient(_app_module.app)
+
+
+@given(field=st.sampled_from(REQUIRED_FIELDS))
+@settings(max_examples=100)
+def test_input_validation_missing_field(field):
+    """Dropping any required field should give us a 422."""
+    payload = _get_base_valid_claim()
+    del payload[field]
+    resp = _validation_client.post("/predict", json=payload)
+    assert resp.status_code == 422, f"Expected 422 when '{field}' is missing, got {resp.status_code}"
+
+
+@given(neg_mileage=st.integers(min_value=-100000, max_value=-1))
+@settings(max_examples=100)
+def test_input_validation_negative_mileage(neg_mileage):
+    """Negative mileage should be rejected."""
+    payload = _get_base_valid_claim()
+    payload["Mileage"] = neg_mileage
+    resp = _validation_client.post("/predict", json=payload)
+    assert resp.status_code == 422
+
+
+@given(
+    cost_field=st.sampled_from(["Part_Cost", "Labour", "Sublet", "Approve_Amount_by_HMI"]),
+    neg_cost=st.floats(min_value=-1e6, max_value=-0.01, allow_nan=False, allow_infinity=False),
+)
+@settings(max_examples=100)
+def test_input_validation_negative_cost(cost_field, neg_cost):
+    """Negative cost values should be rejected."""
+    payload = _get_base_valid_claim()
+    payload[cost_field] = round(neg_cost, 2)
+    resp = _validation_client.post("/predict", json=payload)
+    assert resp.status_code == 422
+
+
+@given(data=st.tuples(
     st.sampled_from(["Claim_Type", "Part_Type", "Cause", "Nature", "Status", "Dealership"]),
     st.text(min_size=1, max_size=20).filter(
         lambda s: s not in (
@@ -229,65 +228,83 @@ _invalid_categorical_strategy = st.tuples(
             ALLOWED_NATURES + ALLOWED_STATUSES + ALLOWED_DEALERSHIPS
         )
     ),
-)
-
-
-# We use a plain TestClient for validation tests — model doesn't need to be loaded
-# because Pydantic validation happens before the endpoint handler runs.
-import app as _app_module
-_validation_client = TestClient(_app_module.app)
-
-
-@given(field=_missing_field_strategy)
-@settings(max_examples=100)
-def test_input_validation_missing_field(field):
-    """For any request missing a required field, API must return HTTP 422."""
-    payload = _get_base_valid_claim()
-    del payload[field]
-
-    response = _validation_client.post("/predict", json=payload)
-    assert response.status_code == 422, (
-        f"Expected 422 when '{field}' is missing, got {response.status_code}: {response.text}"
-    )
-
-
-@given(neg_mileage=_negative_mileage_strategy)
-@settings(max_examples=100)
-def test_input_validation_negative_mileage(neg_mileage):
-    """For any request with negative Mileage, API must return HTTP 422."""
-    payload = _get_base_valid_claim()
-    payload["Mileage"] = neg_mileage
-
-    response = _validation_client.post("/predict", json=payload)
-    assert response.status_code == 422, (
-        f"Expected 422 for Mileage={neg_mileage}, got {response.status_code}: {response.text}"
-    )
-
-
-@given(cost_field=_cost_field_strategy, neg_cost=_negative_cost_strategy)
-@settings(max_examples=100)
-def test_input_validation_negative_cost(cost_field, neg_cost):
-    """For any request with a negative cost field, API must return HTTP 422."""
-    payload = _get_base_valid_claim()
-    payload[cost_field] = round(neg_cost, 2)
-
-    response = _validation_client.post("/predict", json=payload)
-    assert response.status_code == 422, (
-        f"Expected 422 for {cost_field}={neg_cost}, got {response.status_code}: {response.text}"
-    )
-
-
-@given(data=_invalid_categorical_strategy)
+))
 @settings(max_examples=100)
 def test_input_validation_invalid_categorical(data):
-    """For any request with an invalid categorical value, API must return HTTP 422."""
+    """Made-up categorical values should be rejected."""
     cat_field, invalid_value = data
-
     payload = _get_base_valid_claim()
     payload[cat_field] = invalid_value
+    resp = _validation_client.post("/predict", json=payload)
+    assert resp.status_code == 422
 
-    response = _validation_client.post("/predict", json=payload)
-    assert response.status_code == 422, (
-        f"Expected 422 for {cat_field}='{invalid_value}', "
-        f"got {response.status_code}: {response.text}"
-    )
+
+# ---------------------------------------------------------------------------
+# Batch prediction tests
+# ---------------------------------------------------------------------------
+
+def test_batch_predict_json():
+    """Sending two valid claims to /predict/batch should return two scored results."""
+    client, app_module, *restore_args = _make_test_client(0.35)
+    try:
+        claims = [_get_base_valid_claim(), _get_base_valid_claim()]
+        resp = client.post("/predict/batch", json={"claims": claims})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 2
+        assert len(data["results"]) == 2
+        for r in data["results"]:
+            assert "anomaly_probability" in r
+            assert "flag_for_audit" in r
+            assert "input" in r   # original claim echoed back
+    finally:
+        _restore_app(app_module, *restore_args)
+
+
+def test_batch_predict_empty_list():
+    """An empty claims list is valid — should return total=0."""
+    client, app_module, *restore_args = _make_test_client(0.5)
+    try:
+        resp = client.post("/predict/batch", json={"claims": []})
+        assert resp.status_code == 200
+        assert resp.json()["total"] == 0
+    finally:
+        _restore_app(app_module, *restore_args)
+
+
+def test_batch_predict_csv_upload():
+    """Uploading a one-row CSV should return one scored result."""
+    import io as _io
+    client, app_module, *restore_args = _make_test_client(0.92)
+    try:
+        csv_content = (
+            "Mileage,Part_Cost,Labour,Sublet,Claim_Type,Part_Type,Cause,Nature,"
+            "Status,Dealership,Claim_Date,RO_Date,Pdctn_Date,Approve_Amount_by_HMI\n"
+            "45000,1200,450,0,Regular,NONCS1000PARTS,ZZ3,L24,Accept,Modi Hyundai,"
+            "2024-03-15,2024-03-14,2021-06-01,1800\n"
+        )
+        resp = client.post(
+            "/predict/batch/csv",
+            files={"file": ("claims.csv", _io.BytesIO(csv_content.encode()), "text/csv")},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["total"] == 1
+        assert data["results"][0]["anomaly_probability"] == 0.92
+        assert data["results"][0]["flag_for_audit"] is True
+    finally:
+        _restore_app(app_module, *restore_args)
+
+
+def test_batch_csv_rejects_non_csv():
+    """Uploading a .txt file should be rejected with 422."""
+    import io as _io
+    client, app_module, *restore_args = _make_test_client(0.5)
+    try:
+        resp = client.post(
+            "/predict/batch/csv",
+            files={"file": ("data.txt", _io.BytesIO(b"hello"), "text/plain")},
+        )
+        assert resp.status_code == 422
+    finally:
+        _restore_app(app_module, *restore_args)

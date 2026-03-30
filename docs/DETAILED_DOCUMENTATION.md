@@ -33,13 +33,15 @@ project/
 ├── src/
 │   ├── app.py                      # FastAPI server (production)
 │   ├── data_engine.py              # Local CPU data generation
-│   └── trainer.py                  # Local LightGBM training (CPU)
+│   ├── trainer.py                  # Local LightGBM training (CPU)
+│   ├── warranty_model_v1.json      # Trained XGBoost model artifact
+│   └── categorical_mappings.json   # Categorical encoding mappings for inference
 ├── notebooks/
 │   └── xgb_full_pipeline.py       # Combined GPU data gen + XGBoost training
 ├── tests/
 │   ├── test_data_engine.py         # 14 property tests (Properties 1-14)
 │   ├── test_trainer.py             # 4 property tests (Properties 15-18)
-│   └── test_api.py                 # 5 property tests (Properties 19-20)
+│   └── test_api.py                 # 9 tests: 5 property (Properties 19-20) + 4 batch
 ├── docs/
 │   ├── DETAILED_DOCUMENTATION.md   # This file
 │   └── SUMMARY.md                  # Short overview
@@ -202,9 +204,11 @@ Categorical mappings are saved to `categorical_mappings.json` during training an
 
 | Method | Path | Description | Response |
 |--------|------|-------------|----------|
-| GET | `/` | HTML dashboard with claim form and sample records | HTML page |
+| GET | `/` | HTML dashboard with claim form, sample records, and CSV upload | HTML page |
 | GET | `/health` | Health check | `{"status": "healthy", "model_loaded": true/false}` |
-| POST | `/predict` | Score a warranty claim | `{"anomaly_probability": 0.0342, "flag_for_audit": false}` |
+| POST | `/predict` | Score a single warranty claim | `{"anomaly_probability": 0.0342, "flag_for_audit": false}` |
+| POST | `/predict/batch` | Score multiple claims (JSON body) | `{"total": N, "results": [...]}` |
+| POST | `/predict/batch/csv` | Score claims from an uploaded CSV file | `{"total": N, "results": [...]}` |
 
 ### Model Loading
 - Auto-detects model format at startup
@@ -262,6 +266,45 @@ At inference time, the `/predict` endpoint replicates the training feature pipel
 6. Build 19-feature DataFrame matching FEATURE_COLS order exactly
 7. Call model.predict() (XGBoost DMatrix or LightGBM direct)
 
+### Batch Prediction
+
+In practice, dealerships don't submit claims one at a time — they export a day's worth of claims as a CSV and want all of them scored at once. Two batch endpoints support this workflow:
+
+#### POST /predict/batch (JSON)
+Accepts a JSON body with a `claims` array containing up to 500 `ClaimRequest` objects. Each claim is scored independently; a bad row returns an inline error instead of failing the whole batch. The response includes the original input alongside each result so callers can map scores back to their records.
+
+```json
+{
+  "claims": [
+    {"Mileage": 45000, "Part_Cost": 1200, "...": "..."},
+    {"Mileage": 5000, "Part_Cost": 42000, "...": "..."}
+  ]
+}
+```
+
+Response:
+```json
+{
+  "total": 2,
+  "results": [
+    {"anomaly_probability": 0.0342, "flag_for_audit": false, "input": {"..."}},
+    {"anomaly_probability": 0.9100, "flag_for_audit": true, "input": {"..."}}
+  ]
+}
+```
+
+#### POST /predict/batch/csv (File Upload)
+Accepts a multipart CSV file upload. Column names are normalised so common variations (spaces instead of underscores, lowercase, etc.) are handled automatically. This endpoint powers the dashboard's drag-and-drop CSV upload and can also be called programmatically:
+
+```bash
+curl -X POST http://localhost:8000/predict/batch/csv -F "file=@claims.csv"
+```
+
+The response format is identical to the JSON batch endpoint. Max 500 rows per request.
+
+#### Shared Scoring Logic
+Both batch endpoints and the single `/predict` endpoint share the same feature engineering pipeline via an internal `_score_single_claim()` helper. This avoids code duplication and ensures consistent behaviour across all prediction paths.
+
 ### CORS
 - All origins allowed (`allow_origins=["*"]`) for development
 - Should be restricted to specific domains in production
@@ -276,6 +319,8 @@ At inference time, the `/predict` endpoint replicates the training feature pipel
 - Result display with anomaly probability percentage
 - Red warning indicator when flag_for_audit is true (probability > 80%)
 - Green "No Audit Required" indicator when safe
+- CSV batch upload with drag-and-drop support
+- Batch results table with summary statistics (total, safe, flagged, errors)
 
 ### 3 Prefilled Sample Records
 | Sample | Button Color | Key Values | Expected Outcome |
@@ -337,20 +382,23 @@ At inference time, the `/predict` endpoint replicates the training feature pipel
 | 18 | Scale Pos Weight = neg/pos | test_trainer.py | Req 6.1 |
 | 19 | Prediction Response Format & Threshold | test_api.py | Req 7.1-7.3 |
 | 20 | Input Validation Rejects Invalid Inputs | test_api.py | Req 7.4, 8.3, 8.4 |
+| 21-24 | Batch Prediction (JSON + CSV + edge cases) | test_api.py | Req 7.1-7.3 |
 
 ### Running Tests
 ```bash
 pip install pytest hypothesis httpx
-pytest tests/ -v
+pytest tests/ -v   # 27 tests total
 ```
 
 ## 12. Deployment
 
 ### VPS Deployment (CPU-only)
-Required files:
-- `app.py`
-- `warranty_model_v1.json` (XGBoost) OR `warranty_model_v1.pkl` (LightGBM)
-- `categorical_mappings.json`
+The trained model and categorical mappings are included in `src/`, so deployment only requires the `src/` directory:
+- `src/app.py`
+- `src/warranty_model_v1.json` (XGBoost) OR `warranty_model_v1.pkl` (LightGBM)
+- `src/categorical_mappings.json`
+- `src/data_engine.py` (only if you need to regenerate data on the server)
+- `src/trainer.py` (only if you need to retrain on the server)
 
 ```bash
 pip install fastapi uvicorn xgboost pandas
@@ -396,6 +444,10 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 | Invalid date format | Caught in endpoint handler | 422 |
 | Unknown categorical in mappings | Explicit check against mappings dict | 422 |
 | Model prediction error | Catch exception, log traceback | 500 |
+| Batch too large (>500 claims) | Size check before processing | 422 |
+| Non-CSV file uploaded | Extension check | 422 |
+| Unparseable CSV file | Catch pandas read_csv error | 422 |
+| Bad row in batch | Inline error per row, batch continues | 200 (with error in result) |
 | No Parquet files for training | FileNotFoundError raised | N/A |
 | No class variation in labels | ValueError raised | N/A |
 | Division by zero in features | max(denominator, 1e-6) | N/A |

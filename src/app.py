@@ -1,22 +1,44 @@
-from fastapi import FastAPI, HTTPException
+"""
+Warranty Anomaly Detection — FastAPI Server
+
+Serves the trained XGBoost/LightGBM model behind a REST API.
+Supports single-claim prediction, batch JSON prediction, and CSV file uploads.
+Also hosts an inline HTML dashboard so dealership staff can test claims
+without needing a separate frontend build.
+
+Endpoints:
+    GET  /                  → dealer dashboard (HTML)
+    GET  /health            → liveness check
+    POST /predict           → score one claim
+    POST /predict/batch     → score a list of claims (JSON body)
+    POST /predict/batch/csv → score claims from an uploaded CSV file
+
+Author: Monish Modi
+"""
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
-from typing import Literal
+from typing import List, Literal
 from datetime import datetime as dt
 import pandas as pd
 import numpy as np
 import joblib
 import json
+import io
 import logging
 import traceback
 import os
 
-# -- logging setup --
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -- request schema for the /predict endpoint --
+# ---------------------------------------------------------------------------
+# Pydantic schema — mirrors the 14 user-facing fields from the claim form.
+# Pydantic handles type coercion and constraint checks (ge=0, Literal sets)
+# so we get free 422 responses for bad input before any business logic runs.
+# ---------------------------------------------------------------------------
 
 class ClaimRequest(BaseModel):
     Mileage: int = Field(ge=0)
@@ -33,30 +55,44 @@ class ClaimRequest(BaseModel):
     ]
     Status: Literal["Open", "Pending", "Accept", "Suspense(P)"]
     Dealership: Literal["Modi Hyundai", "Viva Honda", "Modi Motors Mumbai", "Modi Motors Pune"]
-    Claim_Date: str  # yyyy-mm-dd
+    Claim_Date: str   # yyyy-mm-dd
     RO_Date: str
     Pdctn_Date: str
     Approve_Amount_by_HMI: float = Field(ge=0.0)
 
-# -- app setup --
+
+class BatchClaimRequest(BaseModel):
+    """Wrapper for the batch JSON endpoint — just a list of individual claims."""
+    claims: List[ClaimRequest]
+
+
+# ---------------------------------------------------------------------------
+# App init + CORS
+# ---------------------------------------------------------------------------
 
 app = FastAPI(title="Modi Auto Group - Warranty Anomaly Engine")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # fine for dev; lock down in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -- model loading: checks for xgboost json first, then lightgbm pkl --
+# ---------------------------------------------------------------------------
+# Model loading
+#
+# We check for the XGBoost JSON artifact first because that's what the Colab
+# GPU pipeline produces. If it's missing we fall back to the LightGBM pickle
+# from the local CPU trainer. If neither exists the server still starts but
+# /predict endpoints will return 503.
+# ---------------------------------------------------------------------------
 
 model = None
 model_loaded = False
-model_type = None  # tracks which framework we loaded
+model_type = None          # "xgboost" or "lightgbm"
 categorical_mappings: dict = {}
 
-# try xgboost first since that's what the colab pipeline produces
 if os.path.exists("warranty_model_v1.json"):
     try:
         import xgboost as xgb
@@ -85,28 +121,147 @@ try:
 except FileNotFoundError:
     logger.warning("categorical_mappings.json not found.")
 
-# -- these must match the exact order used during training --
+# ---------------------------------------------------------------------------
+# Feature column order — must match exactly what the model saw during training.
+# If you retrain with different features, update this list too.
+# ---------------------------------------------------------------------------
 
 FEATURE_COLS = [
-    # raw numerics from the claim
+    # raw numerics straight from the claim
     "Mileage", "Part_Cost", "Labour", "Sublet",
     "Total_Amt", "IGST", "CGST", "SGST",
     "Approve_Amount_by_HMI",
-    # stuff we derive at inference time
+    # derived at inference time (same formulas as trainer.py)
     "Vehicle_Age_Days", "Claim_RO_Gap_Days", "Tax_Rate", "Approval_Ratio",
-    # encoded categoricals
+    # integer-encoded categoricals
     "Claim_Type_idx", "Part_Type_idx", "Cause_idx", "Nature_idx",
     "Status_idx", "Dealership_idx",
 ]
 
 CATEGORICAL_COLS = ["Claim_Type", "Part_Type", "Cause", "Nature", "Status", "Dealership"]
 
-# -- inline dashboard html --
+# hard cap so one rogue request can't OOM the server
+MAX_BATCH_SIZE = 500
 
+# ---------------------------------------------------------------------------
+# CSV column normalisation
+#
+# Dealerships might export CSVs with slightly different headers — spaces
+# instead of underscores, lowercase, etc. This map lets us accept the most
+# common variations without forcing users to rename columns manually.
+# ---------------------------------------------------------------------------
+
+_CSV_COL_MAP = {
+    "mileage": "Mileage", "part_cost": "Part_Cost", "part cost": "Part_Cost",
+    "labour": "Labour", "sublet": "Sublet",
+    "claim_type": "Claim_Type", "claim type": "Claim_Type",
+    "part_type": "Part_Type", "part type": "Part_Type",
+    "cause": "Cause", "nature": "Nature", "status": "Status",
+    "dealership": "Dealership",
+    "claim_date": "Claim_Date", "claim date": "Claim_Date",
+    "ro_date": "RO_Date", "ro date": "RO_Date",
+    "pdctn_date": "Pdctn_Date", "production date": "Pdctn_Date",
+    "pdctn date": "Pdctn_Date",
+    "approve_amount_by_hmi": "Approve_Amount_by_HMI",
+    "approved amount (hmi)": "Approve_Amount_by_HMI",
+    "approve amount by hmi": "Approve_Amount_by_HMI",
+}
+
+
+def _normalize_csv_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Try to rename CSV columns to match our expected field names.
+    Columns that already have the right casing are left untouched."""
+    rename = {}
+    for col in df.columns:
+        key = col.strip().lower()
+        if key in _CSV_COL_MAP:
+            rename[col] = _CSV_COL_MAP[key]
+    return df.rename(columns=rename)
+
+# ---------------------------------------------------------------------------
+# Shared scoring logic
+#
+# Both the single /predict and the batch endpoints need to run the same
+# feature engineering + model inference pipeline. This helper takes a plain
+# dict (from Pydantic .model_dump() or a CSV row) and returns the result.
+# Errors are returned inline as {"error": "..."} instead of raising, so
+# one bad row in a batch doesn't kill the whole request.
+# ---------------------------------------------------------------------------
+
+def _score_single_claim(claim_dict: dict) -> dict:
+    """Run feature engineering and model inference on one claim.
+
+    Returns {"anomaly_probability": float, "flag_for_audit": bool}
+    on success, or {"error": str} if something is wrong with the row.
+    """
+    # parse the three date fields
+    try:
+        claim_date = dt.strptime(claim_dict["Claim_Date"], "%Y-%m-%d")
+        ro_date    = dt.strptime(claim_dict["RO_Date"],    "%Y-%m-%d")
+        pdctn_date = dt.strptime(claim_dict["Pdctn_Date"], "%Y-%m-%d")
+    except (ValueError, KeyError) as e:
+        return {"error": f"bad date: {e}"}
+
+    try:
+        # encode categoricals using the saved mappings from training
+        cat_indices = {}
+        for col in CATEGORICAL_COLS:
+            value = claim_dict.get(col)
+            mapping = categorical_mappings.get(col, {})
+            if value not in mapping:
+                return {"error": f"Unknown value '{value}' for {col}"}
+            cat_indices[col + "_idx"] = mapping[value]
+
+        # replicate the same tax / total calculation the trainer uses
+        pre_tax   = float(claim_dict["Part_Cost"]) + float(claim_dict["Labour"]) + float(claim_dict["Sublet"])
+        igst      = pre_tax * 0.18          # assume inter-state (majority case)
+        total_amt = pre_tax + igst
+
+        # derived temporal + ratio features
+        vehicle_age_days  = (claim_date - pdctn_date).days
+        claim_ro_gap_days = (claim_date - ro_date).days
+        tax_rate          = igst / max(pre_tax, 1e-6)
+        approval_ratio    = float(claim_dict["Approve_Amount_by_HMI"]) / max(total_amt, 1e-6)
+
+        row = {
+            "Mileage": int(claim_dict["Mileage"]),
+            "Part_Cost": float(claim_dict["Part_Cost"]),
+            "Labour": float(claim_dict["Labour"]),
+            "Sublet": float(claim_dict["Sublet"]),
+            "Total_Amt": total_amt, "IGST": igst, "CGST": 0.0, "SGST": 0.0,
+            "Approve_Amount_by_HMI": float(claim_dict["Approve_Amount_by_HMI"]),
+            "Vehicle_Age_Days": float(vehicle_age_days),
+            "Claim_RO_Gap_Days": float(claim_ro_gap_days),
+            "Tax_Rate": tax_rate, "Approval_Ratio": approval_ratio,
+        }
+        row.update(cat_indices)
+
+        df = pd.DataFrame([row], columns=FEATURE_COLS)
+
+        if model_type == "xgboost":
+            import xgboost as xgb
+            dmat = xgb.DMatrix(df)
+            score = float(model.predict(dmat)[0])
+        else:
+            score = float(model.predict(df)[0])
+
+        return {
+            "anomaly_probability": round(score, 4),
+            "flag_for_audit": bool(score > 0.8),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+# ---------------------------------------------------------------------------
+# Inline dashboard HTML
+#
+# Keeping the dashboard as a single inline string avoids the need for a
+# static-files directory or a JS build step. It's not the prettiest
+# approach for a large frontend, but for a single-page demo it works well.
+# ---------------------------------------------------------------------------
 
 def _build_dashboard_html() -> str:
-    """builds the full dealer dashboard page as a single html string.
-    kept inline to avoid a separate static files setup."""
+    """Return the full dealer dashboard as an HTML string."""
     return """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -142,6 +297,20 @@ def _build_dashboard_html() -> str:
   .flag-audit { background: #fee2e2; color: #991b1b; }
   .error-msg { color: #dc2626; text-align: center; padding: 12px; font-weight: 500; }
   .sample-section { display: flex; gap: 10px; flex-wrap: wrap; }
+  /* batch / CSV upload styles */
+  .csv-upload-area { border: 2px dashed #ccd1d9; border-radius: 8px; padding: 28px; text-align: center; cursor: pointer; transition: border-color 0.2s, background 0.2s; }
+  .csv-upload-area:hover, .csv-upload-area.dragover { border-color: #3b82f6; background: #eff6ff; }
+  .csv-upload-area input[type=file] { display: none; }
+  .csv-upload-area p { font-size: 0.92rem; color: #555; margin-top: 6px; }
+  .batch-table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 0.85rem; }
+  .batch-table th, .batch-table td { padding: 8px 10px; border: 1px solid #e8ecf1; text-align: left; }
+  .batch-table th { background: #f5f7fa; font-weight: 600; color: #1a2744; }
+  .batch-table .flag-audit-cell { background: #fee2e2; color: #991b1b; font-weight: 600; }
+  .batch-table .flag-safe-cell { background: #dcfce7; color: #166534; font-weight: 600; }
+  .batch-summary { display: flex; gap: 18px; margin-bottom: 14px; flex-wrap: wrap; }
+  .batch-summary .stat { background: #f5f7fa; border-radius: 6px; padding: 12px 20px; text-align: center; }
+  .batch-summary .stat .num { font-size: 1.5rem; font-weight: 700; }
+  .batch-summary .stat .lbl { font-size: 0.8rem; color: #555; }
 </style>
 </head>
 <body>
@@ -153,7 +322,7 @@ def _build_dashboard_html() -> str:
 
 <div class="container">
 
-  <!-- Sample Records -->
+  <!-- quick-fill buttons so reviewers can test without typing -->
   <div class="card">
     <h2>Sample Records</h2>
     <p style="font-size:0.85rem;color:#666;margin-bottom:12px;">Click a button to populate the form with a test record, then submit to see the prediction.</p>
@@ -164,7 +333,32 @@ def _build_dashboard_html() -> str:
     </div>
   </div>
 
-  <!-- Claim Form -->
+  <!-- CSV batch upload — drag-and-drop or click to browse -->
+  <div class="card">
+    <h2>Batch Prediction &mdash; CSV Upload</h2>
+    <p style="font-size:0.85rem;color:#666;margin-bottom:12px;">Upload a CSV file with multiple warranty claims. Required columns: Mileage, Part_Cost, Labour, Sublet, Claim_Type, Part_Type, Cause, Nature, Status, Dealership, Claim_Date, RO_Date, Pdctn_Date, Approve_Amount_by_HMI.</p>
+    <div class="csv-upload-area" id="csv-drop-zone"
+         onclick="document.getElementById('csv-file-input').click()"
+         ondragover="event.preventDefault(); this.classList.add('dragover')"
+         ondragleave="this.classList.remove('dragover')"
+         ondrop="handleCsvDrop(event)">
+      <input type="file" id="csv-file-input" accept=".csv" onchange="handleCsvFile(this.files[0])">
+      <span style="font-size:2rem;">&#128196;</span>
+      <p>Drag &amp; drop a CSV file here, or click to browse</p>
+    </div>
+    <div id="csv-status" style="margin-top:10px;font-size:0.88rem;color:#555;"></div>
+  </div>
+
+  <!-- batch results table (hidden until a CSV is processed) -->
+  <div class="card" id="batch-result-area" style="display:none;">
+    <h2>Batch Results</h2>
+    <div class="batch-summary" id="batch-summary"></div>
+    <div style="overflow-x:auto;">
+      <table class="batch-table" id="batch-table"></table>
+    </div>
+  </div>
+
+  <!-- single-claim form -->
   <div class="card">
     <h2>Submit Warranty Claim</h2>
     <form id="claim-form" onsubmit="submitClaim(event)">
@@ -272,7 +466,7 @@ def _build_dashboard_html() -> str:
     </form>
   </div>
 
-  <!-- Result Area -->
+  <!-- single-claim result card -->
   <div class="card" id="result-area">
     <h2>Prediction Result</h2>
     <div class="result-box" id="result-box">
@@ -286,6 +480,7 @@ def _build_dashboard_html() -> str:
 </div>
 
 <script>
+/* ---- sample records for one-click testing ---- */
 const SAMPLES = {
   normal: {
     Mileage: 45000, Part_Cost: 1200, Labour: 450, Sublet: 0,
@@ -319,9 +514,9 @@ function loadSample(key) {
   document.getElementById("result-area").style.display = "none";
 }
 
+/* ---- single claim submission ---- */
 async function submitClaim(e) {
   e.preventDefault();
-  const form = document.getElementById("claim-form");
   const data = {};
   const fields = ["Mileage","Part_Cost","Labour","Sublet","Approve_Amount_by_HMI",
                    "Claim_Type","Part_Type","Cause","Nature","Status","Dealership",
@@ -337,14 +532,14 @@ async function submitClaim(e) {
     }
   }
 
-  const resultArea = document.getElementById("result-area");
-  const resultBox = document.getElementById("result-box");
-  const resultProb = document.getElementById("result-prob");
-  const resultFlag = document.getElementById("result-flag");
+  const resultArea  = document.getElementById("result-area");
+  const resultBox   = document.getElementById("result-box");
+  const resultProb  = document.getElementById("result-prob");
+  const resultFlag  = document.getElementById("result-flag");
   const resultError = document.getElementById("result-error");
 
   resultArea.style.display = "block";
-  resultBox.style.display = "none";
+  resultBox.style.display  = "none";
   resultError.style.display = "none";
   resultProb.textContent = "...";
 
@@ -378,43 +573,118 @@ async function submitClaim(e) {
     resultError.textContent = "Error: " + err.message;
   }
 }
+
+/* ---- CSV batch upload handlers ---- */
+function handleCsvDrop(e) {
+  e.preventDefault();
+  document.getElementById('csv-drop-zone').classList.remove('dragover');
+  const file = e.dataTransfer.files[0];
+  if (file) handleCsvFile(file);
+}
+
+async function handleCsvFile(file) {
+  if (!file || !file.name.endsWith('.csv')) {
+    document.getElementById('csv-status').textContent = 'Please select a valid .csv file.';
+    return;
+  }
+  document.getElementById('csv-status').textContent = 'Uploading ' + file.name + '...';
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    const resp = await fetch('/predict/batch/csv', { method: 'POST', body: formData });
+    if (!resp.ok) {
+      const err = await resp.json();
+      throw new Error(err.detail || 'Upload failed');
+    }
+    const data = await resp.json();
+    document.getElementById('csv-status').textContent =
+      file.name + ' — ' + data.total + ' claims processed.';
+    renderBatchResults(data);
+  } catch (err) {
+    document.getElementById('csv-status').textContent = 'Error: ' + err.message;
+    document.getElementById('batch-result-area').style.display = 'none';
+  }
+}
+
+/* ---- render the batch results table + summary stats ---- */
+function renderBatchResults(data) {
+  const area = document.getElementById('batch-result-area');
+  area.style.display = 'block';
+
+  const flagged = data.results.filter(r => r.flag_for_audit).length;
+  const errors  = data.results.filter(r => r.error).length;
+  const safe    = data.total - flagged - errors;
+
+  document.getElementById('batch-summary').innerHTML =
+    '<div class="stat"><div class="num">' + data.total + '</div><div class="lbl">Total Claims</div></div>' +
+    '<div class="stat"><div class="num" style="color:#166534">' + safe + '</div><div class="lbl">Safe</div></div>' +
+    '<div class="stat"><div class="num" style="color:#dc2626">' + flagged + '</div><div class="lbl">Flagged for Audit</div></div>' +
+    (errors > 0 ? '<div class="stat"><div class="num" style="color:#b45309">' + errors + '</div><div class="lbl">Errors</div></div>' : '');
+
+  let html = '<thead><tr><th>#</th><th>Dealership</th><th>Claim Type</th>' +
+             '<th>Mileage</th><th>Total Cost</th><th>Anomaly %</th><th>Verdict</th></tr></thead><tbody>';
+  data.results.forEach(function(r, i) {
+    if (r.error) {
+      html += '<tr><td>' + (i+1) + '</td><td colspan="5">' + r.error +
+              '</td><td class="flag-audit-cell">Error</td></tr>';
+    } else {
+      const pct     = (r.anomaly_probability * 100).toFixed(2) + '%';
+      const cls     = r.flag_for_audit ? 'flag-audit-cell' : 'flag-safe-cell';
+      const verdict = r.flag_for_audit ? 'AUDIT' : 'Safe';
+      const inp     = r.input || {};
+      const cost    = (parseFloat(inp.Part_Cost||0) + parseFloat(inp.Labour||0) +
+                       parseFloat(inp.Sublet||0)).toFixed(2);
+      html += '<tr><td>' + (i+1) + '</td><td>' + (inp.Dealership||'-') +
+              '</td><td>' + (inp.Claim_Type||'-') + '</td><td>' + (inp.Mileage||'-') +
+              '</td><td>' + cost + '</td><td>' + pct +
+              '</td><td class="' + cls + '">' + verdict + '</td></tr>';
+    }
+  });
+  html += '</tbody>';
+  document.getElementById('batch-table').innerHTML = html;
+}
 </script>
 </body>
 </html>"""
 
 
-# -- routes --
-
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    """Serve the warranty anomaly detection dashboard."""
+    """Serve the dealer dashboard."""
     return HTMLResponse(content=_build_dashboard_html())
 
 
 @app.get("/health")
 def health():
-    """Health check endpoint."""
+    """Simple liveness probe — also tells the caller whether a model is loaded."""
     return {"status": "healthy", "model_loaded": model_loaded}
 
 
 @app.post("/predict")
 def predict(claim: ClaimRequest):
-    """takes a single warranty claim and returns an anomaly score.
-    replicates the same feature engineering pipeline used during training."""
+    """Score a single warranty claim and return an anomaly probability.
+
+    Replicates the same feature engineering pipeline used during training
+    so the model sees identical feature distributions at inference time.
+    """
     if not model_loaded:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
-    # --- Parse dates ---
+    # parse dates up front so we can give a clear error message
     try:
         claim_date = dt.strptime(claim.Claim_Date, "%Y-%m-%d")
-        ro_date = dt.strptime(claim.RO_Date, "%Y-%m-%d")
+        ro_date    = dt.strptime(claim.RO_Date,    "%Y-%m-%d")
         pdctn_date = dt.strptime(claim.Pdctn_Date, "%Y-%m-%d")
     except ValueError as e:
         raise HTTPException(status_code=422, detail=f"bad date format, need yyyy-mm-dd: {e}")
 
     try:
-        # look up the integer index for each categorical using the saved mappings
+        # look up the integer index for each categorical
         cat_indices = {}
         for col in CATEGORICAL_COLS:
             value = getattr(claim, col)
@@ -426,20 +696,21 @@ def predict(claim: ClaimRequest):
                 )
             cat_indices[col + "_idx"] = mapping[value]
 
-        # at inference we don't get raw tax columns, so we compute them
-        # assuming inter-state (18% IGST) which is the majority case
-        pre_tax = claim.Part_Cost + claim.Labour + claim.Sublet
-        igst = pre_tax * 0.18
-        cgst = 0.0
-        sgst = 0.0
+        # we don't get raw tax columns at inference, so assume inter-state
+        # (18% IGST) which covers the majority of claims
+        pre_tax   = claim.Part_Cost + claim.Labour + claim.Sublet
+        igst      = pre_tax * 0.18
+        cgst      = 0.0
+        sgst      = 0.0
         total_amt = pre_tax + igst
 
         # same derived features the trainer computes
-        vehicle_age_days = (claim_date - pdctn_date).days
+        vehicle_age_days  = (claim_date - pdctn_date).days
         claim_ro_gap_days = (claim_date - ro_date).days
+
         # guard against division by zero — if there's no billable work,
         # a near-zero ratio is the right semantic answer
-        tax_rate = (igst + cgst + sgst) / max(pre_tax, 1e-6)
+        tax_rate       = (igst + cgst + sgst) / max(pre_tax, 1e-6)
         approval_ratio = claim.Approve_Amount_by_HMI / max(total_amt, 1e-6)
 
         # assemble the feature vector in the exact column order the model expects
@@ -449,9 +720,7 @@ def predict(claim: ClaimRequest):
             "Labour": claim.Labour,
             "Sublet": claim.Sublet,
             "Total_Amt": total_amt,
-            "IGST": igst,
-            "CGST": cgst,
-            "SGST": sgst,
+            "IGST": igst, "CGST": cgst, "SGST": sgst,
             "Approve_Amount_by_HMI": claim.Approve_Amount_by_HMI,
             "Vehicle_Age_Days": float(vehicle_age_days),
             "Claim_RO_Gap_Days": float(claim_ro_gap_days),
@@ -469,6 +738,7 @@ def predict(claim: ClaimRequest):
             score = float(model.predict(dmat)[0])
         else:
             score = float(model.predict(df)[0])
+
         return {
             "anomaly_probability": round(score, 4),
             "flag_for_audit": bool(score > 0.8),
@@ -481,4 +751,83 @@ def predict(claim: ClaimRequest):
         raise HTTPException(status_code=500, detail="Internal prediction error")
 
 
-# To run: uvicorn app:app --reload
+# ---------------------------------------------------------------------------
+# Batch prediction endpoints
+#
+# In practice, dealerships don't submit claims one at a time — they export
+# a day's worth of claims as a CSV and want all of them scored at once.
+# Two flavours:
+#   /predict/batch     → JSON body with a list of claims (for programmatic use)
+#   /predict/batch/csv → multipart file upload (for the dashboard UI)
+# ---------------------------------------------------------------------------
+
+@app.post("/predict/batch")
+def predict_batch(batch: BatchClaimRequest):
+    """Score a list of warranty claims in one request.
+
+    Each claim is scored independently; a bad row returns an inline error
+    instead of failing the whole batch. The response includes the original
+    input alongside each result so callers can map scores back to their data.
+    """
+    if not model_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if len(batch.claims) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Batch too large. Max {MAX_BATCH_SIZE} claims per request.",
+        )
+
+    results = []
+    for claim in batch.claims:
+        claim_dict = claim.model_dump()
+        result = _score_single_claim(claim_dict)
+        result["input"] = claim_dict
+        results.append(result)
+
+    return {"total": len(results), "results": results}
+
+
+@app.post("/predict/batch/csv")
+async def predict_batch_csv(file: UploadFile = File(...)):
+    """Accept a CSV file, score every row, return JSON results.
+
+    Column names are normalised so common variations (spaces, lowercase)
+    are handled automatically. This endpoint powers the dashboard's
+    drag-and-drop CSV upload and can also be called programmatically
+    with curl or any HTTP client.
+    """
+    if not model_loaded:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=422, detail="Only .csv files are accepted.")
+
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not parse CSV: {e}")
+
+    if len(df) > MAX_BATCH_SIZE:
+        raise HTTPException(
+            status_code=422,
+            detail=f"CSV has {len(df)} rows. Max {MAX_BATCH_SIZE}.",
+        )
+
+    df = _normalize_csv_columns(df)
+
+    results = []
+    for _, row in df.iterrows():
+        claim_dict = row.to_dict()
+        # pandas gives us numpy scalars; convert to native Python for JSON
+        claim_dict = {
+            k: (v.item() if hasattr(v, "item") else v)
+            for k, v in claim_dict.items()
+        }
+        result = _score_single_claim(claim_dict)
+        result["input"] = claim_dict
+        results.append(result)
+
+    return {"total": len(results), "results": results}
+
+
+# To run locally: uvicorn app:app --reload

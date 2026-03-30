@@ -73,11 +73,13 @@ uvicorn app:app --host 0.0.0.0 --port 8000
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/` | Web dashboard with claim form and 3 sample test records |
-| POST | `/predict` | Submit claim JSON, get anomaly score |
+| GET | `/` | Web dashboard with claim form, sample records, and CSV upload |
+| POST | `/predict` | Score a single claim (JSON body) |
+| POST | `/predict/batch` | Score multiple claims in one request (JSON body) |
+| POST | `/predict/batch/csv` | Upload a CSV file and score every row |
 | GET | `/health` | Health check with model status |
 
-### Example Request
+### Single Prediction
 
 ```bash
 curl -X POST http://localhost:8000/predict \
@@ -100,14 +102,48 @@ curl -X POST http://localhost:8000/predict \
   }'
 ```
 
-### Response
-
 ```json
 {
   "anomaly_probability": 0.0342,
   "flag_for_audit": false
 }
 ```
+
+### Batch Prediction (JSON)
+
+```bash
+curl -X POST http://localhost:8000/predict/batch \
+  -H "Content-Type: application/json" \
+  -d '{"claims": [
+    {"Mileage": 45000, "Part_Cost": 1200, "Labour": 450, "Sublet": 0,
+     "Claim_Type": "Regular", "Part_Type": "NONCS1000PARTS", "Cause": "ZZ3",
+     "Nature": "L24", "Status": "Accept", "Dealership": "Modi Hyundai",
+     "Claim_Date": "2024-03-15", "RO_Date": "2024-03-14",
+     "Pdctn_Date": "2021-06-01", "Approve_Amount_by_HMI": 1800}
+  ]}'
+```
+
+```json
+{
+  "total": 1,
+  "results": [
+    {
+      "anomaly_probability": 0.0342,
+      "flag_for_audit": false,
+      "input": { "..." }
+    }
+  ]
+}
+```
+
+### Batch Prediction (CSV Upload)
+
+```bash
+curl -X POST http://localhost:8000/predict/batch/csv \
+  -F "file=@claims.csv"
+```
+
+The CSV endpoint accepts common column name variations (spaces, lowercase) and returns the same response format as the JSON batch endpoint. Max 500 rows per request.
 
 ## Model Details
 
@@ -121,15 +157,18 @@ curl -X POST http://localhost:8000/predict \
 ## Project Structure
 
 ```
-├── app.py                          # FastAPI server + dashboard
-├── data_engine.py                  # Synthetic data generation (CPU)
-├── trainer.py                      # LightGBM training (CPU)
-├── colab/
+├── src/
+│   ├── app.py                      # FastAPI server + dashboard
+│   ├── data_engine.py              # Synthetic data generation (CPU)
+│   ├── trainer.py                  # LightGBM training (CPU)
+│   ├── warranty_model_v1.json      # Trained XGBoost model artifact
+│   └── categorical_mappings.json   # Categorical encoding mappings for inference
+├── notebooks/
 │   └── xgb_full_pipeline.py       # GPU data gen + XGBoost training (Colab)
 ├── tests/
 │   ├── test_data_engine.py         # 14 property tests
 │   ├── test_trainer.py             # 4 property tests
-│   └── test_api.py                 # 5 property tests
+│   └── test_api.py                 # 9 tests (5 property + 4 batch)
 ├── docs/
 │   ├── DETAILED_DOCUMENTATION.md   # Full technical documentation
 │   └── SUMMARY.md                  # Short overview
@@ -138,7 +177,7 @@ curl -X POST http://localhost:8000/predict \
 
 ## Testing
 
-23 property-based tests using [Hypothesis](https://hypothesis.readthedocs.io/) covering 20 correctness properties:
+27 tests (23 property-based using [Hypothesis](https://hypothesis.readthedocs.io/) + 4 batch endpoint tests) covering 20 correctness properties:
 
 ```bash
 pip install pytest hypothesis httpx
