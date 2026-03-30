@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.hypothesis/
+.pytest_cache/
+*.parquet
+warranty_model_v1.json
+warranty_model_v1.pkl
+categorical_mappings.json
+.env
+*.egg-info/
+dist/
+build/
