@@ -1,0 +1,48 @@
+{
+  "Claim_Type": {
+    "Campaign": 0,
+    "Free Service Labor Claim": 1,
+    "Regular": 2,
+    "TMA": 3
+  },
+  "Part_Type": {
+    "NONCS1000PARTS": 0,
+    "RS10000PARTS": 1
+  },
+  "Cause": {
+    "ZZ2": 0,
+    "ZZ3": 1,
+    "ZZ4": 2,
+    "ZZ7": 3
+  },
+  "Nature": {
+    "A38": 0,
+    "B32": 1,
+    "B33": 2,
+    "D91": 3,
+    "D92": 4,
+    "DA1": 5,
+    "DJ6": 6,
+    "L23": 7,
+    "L24": 8,
+    "L31": 9,
+    "Q26": 10,
+    "V84": 11,
+    "V88": 12,
+    "W11": 13,
+    "W13": 14,
+    "W17": 15
+  },
+  "Status": {
+    "Accept": 0,
+    "Open": 1,
+    "Pending": 2,
+    "Suspense(P)": 3
+  },
+  "Dealership": {
+    "Modi Hyundai": 0,
+    "Modi Motors Mumbai": 1,
+    "Modi Motors Pune": 2,
+    "Viva Honda": 3
+  }
+}
